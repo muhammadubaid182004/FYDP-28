@@ -4,13 +4,13 @@ Handles all machine learning inference for DR classification
 """
 
 from flask import Flask, request, jsonify
-from werkzeug.utils import secure_filename
 from PIL import Image
 import io
 import numpy as np
 import onnxruntime as rt
 import logging
 import os
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,7 +22,9 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Configuration
 # ─────────────────────────────────────────────────────────────
 
-MODEL_PATH = os.getenv("MODEL_PATH", "./models/dr-classification.onnx")
+MODEL_ENGINE_PATH = os.getenv("MODEL_ENGINE_PATH", "")
+MODEL_ONNX_PATH = os.getenv("MODEL_ONNX_PATH", "")
+MODEL_PT_PATH = os.getenv("MODEL_PT_PATH", "")
 INPUT_SIZE = 224
 CONFIDENCE_THRESHOLD = 0.5
 
@@ -44,30 +46,110 @@ RECOMMENDATIONS = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Load Model
+# Load Model (priority: TensorRT engine -> ONNX)
 # ─────────────────────────────────────────────────────────────
 
-try:
-    # Load ONNX model
+runtime_backend = None
+model_session = None
+input_name = None
+output_name = None
+model_path = None
+
+
+def _existing_path(candidates):
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate).resolve()
+        if candidate_path.exists():
+            return str(candidate_path)
+    return None
+
+
+def _load_engine_runner(engine_path):
+    # TensorRT Python bindings are optional; if unavailable we fall back to ONNX.
+    try:
+        import tensorrt as trt  # type: ignore
+    except Exception as exc:
+        logger.warning(f"TensorRT engine found but TensorRT runtime unavailable: {exc}")
+        return None
+
+    logger.warning(
+        "TensorRT engine selected (%s) but runtime execution is not wired yet; falling back to ONNX if available.",
+        engine_path,
+    )
+    _ = trt  # Keep import validated; prevents linting of unused import.
+    return None
+
+
+def _load_onnx_runner(onnx_path):
     sess_options = rt.SessionOptions()
     sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    model_session = rt.InferenceSession(
-        MODEL_PATH,
+
+    session = rt.InferenceSession(
+        onnx_path,
         sess_options=sess_options,
-        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
-    
-    # Get input/output info
-    input_name = model_session.get_inputs()[0].name
-    output_name = model_session.get_outputs()[0].name
-    
-    logger.info(f"✓ Model loaded successfully from {MODEL_PATH}")
-    logger.info(f"  Input: {input_name}, Output: {output_name}")
-    
-except Exception as e:
-    logger.error(f"Failed to load model: {e}")
-    model_session = None
+    return session, session.get_inputs()[0].name, session.get_outputs()[0].name
+
+
+engine_candidate = _existing_path(
+    [
+        MODEL_ENGINE_PATH,
+        "./best.engine",
+        "./models/dr-classification.engine",
+        "../backend/best.engine",
+    ]
+)
+onnx_candidate = _existing_path(
+    [
+        MODEL_ONNX_PATH,
+        os.getenv("MODEL_PATH", ""),
+        "./best.onnx",
+        "./models/dr-classification.onnx",
+        "../backend/best.onnx",
+    ]
+)
+pt_candidate = _existing_path(
+    [
+        MODEL_PT_PATH,
+        "./best.pt",
+        "./models/dr-classification.pt",
+        "../backend/best.pt",
+    ]
+)
+
+if engine_candidate:
+    engine_runner = _load_engine_runner(engine_candidate)
+    if engine_runner:
+        runtime_backend = "tensorrt-engine"
+        model_path = engine_candidate
+        model_session = engine_runner
+
+if runtime_backend is None and onnx_candidate:
+    try:
+        model_session, input_name, output_name = _load_onnx_runner(onnx_candidate)
+        runtime_backend = "onnxruntime"
+        model_path = onnx_candidate
+        logger.info(f"✓ ONNX model loaded successfully from {model_path}")
+        logger.info(f"  Input: {input_name}, Output: {output_name}")
+    except Exception as exc:
+        logger.error(f"Failed to load ONNX model from {onnx_candidate}: {exc}")
+        model_session = None
+
+if runtime_backend is None:
+    if pt_candidate:
+        logger.warning(
+            "Found PT model at %s, but this service currently serves ONNX/TensorRT runtime paths.",
+            pt_candidate,
+        )
+    logger.error(
+        "No usable model backend available. Checked engine=%s onnx=%s pt=%s",
+        engine_candidate,
+        onnx_candidate,
+        pt_candidate,
+    )
 
 # ─────────────────────────────────────────────────────────────
 # Preprocessing
@@ -110,7 +192,9 @@ def health_check():
     return jsonify({
         "status": "healthy" if model_session else "unhealthy",
         "model_loaded": model_session is not None,
-        "model_path": MODEL_PATH
+        "model_path": model_path,
+        "backend": runtime_backend,
+        "pt_candidate": pt_candidate,
     }), 200 if model_session else 503
 
 # ─────────────────────────────────────────────────────────────
@@ -141,7 +225,7 @@ def predict():
         image_bytes = file.read()
         processed_image = preprocess_image(image_bytes)
         
-        # Run inference
+        # Run inference (ONNX currently active backend)
         outputs = model_session.run(None, {input_name: processed_image})
         predictions = outputs[0][0]  # First batch, all classes
         
@@ -165,7 +249,7 @@ def predict():
                 CLASS_LABELS[i]: float(predictions[i])
                 for i in range(len(CLASS_LABELS))
             },
-            "model_version": "1.0.0"
+            "model_version": f"{runtime_backend or 'unknown'}-1.0.0"
         }), 200
         
     except Exception as e:
@@ -242,7 +326,9 @@ def root():
     return jsonify({
         "service": "DR Classification Model Service",
         "version": "1.0.0",
-        "model_path": MODEL_PATH,
+        "model_path": model_path,
+        "backend": runtime_backend,
+        "pt_candidate": pt_candidate,
         "model_loaded": model_session is not None,
         "endpoints": ["/healthz", "/api/predict", "/api/predict-batch"]
     }), 200
