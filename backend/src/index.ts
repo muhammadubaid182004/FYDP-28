@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import bcryptjs from "bcryptjs";
 import pg from "pg";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -16,18 +17,29 @@ const PORT = Number(process.env.PORT || 8000);
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const DATABASE_URL = process.env.DATABASE_URL;
 const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
+const MODEL_ENGINE_PATH = path.resolve(
+  process.cwd(),
+  process.env.MODEL_ENGINE_PATH || "best.engine",
+);
 const MODEL_ONNX_PATH = path.resolve(
   process.cwd(),
   process.env.MODEL_ONNX_PATH || "best.onnx",
 );
+const TENSORRT_RUNNER_PATH = path.resolve(
+  process.cwd(),
+  process.env.TENSORRT_RUNNER_PATH || "tensorrt_inference.py",
+);
 const MODEL_INPUT_SIZE = Number(process.env.MODEL_INPUT_SIZE || 256);
 const MODEL_CLASS_LABELS = (
-  process.env.MODEL_CLASS_LABELS || "No DR,RDR"
+  process.env.MODEL_CLASS_LABELS || "Nrdr,Rdr"
 )
   .split(",")
   .map((label) => label.trim())
   .filter(Boolean);
+const MODEL_NORMALIZATION = (process.env.MODEL_NORMALIZATION || "none").toLowerCase();
+const MODEL_OUTPUT_KIND = (process.env.MODEL_OUTPUT_KIND || "auto").toLowerCase();
 const MODEL_CONFIDENCE_THRESHOLD = Number(process.env.MODEL_CONFIDENCE_THRESHOLD || 0.5);
+const ALLOW_ONNX_FALLBACK = (process.env.ALLOW_ONNX_FALLBACK || "true").toLowerCase() !== "false";
 const DATABASE_SSL = (process.env.DATABASE_SSL || "").toLowerCase();
 const SHOULD_USE_DATABASE_SSL =
   DATABASE_SSL === "true" ||
@@ -51,15 +63,23 @@ const pool = new Pool({
   ssl: SHOULD_USE_DATABASE_SSL ? { rejectUnauthorized: false } : undefined,
 });
 
-pool
-  .connect()
-  .then((client) => {
-    console.log("Database connected successfully.");
-    client.release();
-  })
-  .catch((error: Error) => {
-    console.error("Failed to connect to PostgreSQL:", error.message);
-  });
+void (async () => {
+  try {
+    const [dbResult, modelAvailability] = await Promise.all([
+      pool.query("SELECT 1"),
+      getModelAvailability(),
+    ]);
+    if (dbResult.rowCount !== null) {
+      console.log("Database connected successfully.");
+    }
+    console.log("Model availability check", modelAvailability);
+  } catch (error) {
+    console.error(
+      "Startup connectivity check failed:",
+      error instanceof Error ? error.message : "Unknown startup error",
+    );
+  }
+})();
 
 void fs.mkdir(UPLOADS_DIR, { recursive: true }).catch((error: Error) => {
   console.error("Failed to ensure uploads directory exists:", error.message);
@@ -130,6 +150,13 @@ interface AuthRequest extends Request {
   file?: Express.Multer.File;
 }
 
+interface LocalInferenceResult {
+  predictedLabel: string;
+  confidence: number;
+  recommendation: string;
+  modelVersion: string;
+}
+
 function mapUserForResponse(user: DbUserRow) {
   return {
     id: user.id,
@@ -166,6 +193,7 @@ function getUploadPublicUrl(req: Request, filename: string) {
 }
 
 let modelSessionPromise: Promise<unknown> | null = null;
+let selectedInferenceBackend: "engine" | "onnx" = "onnx";
 
 type OrtModuleShape = {
   InferenceSession: {
@@ -207,11 +235,147 @@ function softmax(values: number[]) {
   return exps.map((value) => value / total);
 }
 
+function normalizeOutput(rawValues: number[]) {
+  if (MODEL_OUTPUT_KIND === "logits") {
+    return softmax(rawValues);
+  }
+  if (MODEL_OUTPUT_KIND === "probs") {
+    return rawValues;
+  }
+  const isProbLike =
+    Math.max(...rawValues) <= 1 &&
+    Math.min(...rawValues) >= 0 &&
+    Math.abs(rawValues.reduce((sum, value) => sum + value, 0) - 1) < 1e-3;
+  return isProbLike ? rawValues : softmax(rawValues);
+}
+
+async function checkFileExists(filePath: string) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getModelAvailability() {
+  const [engineExists, onnxExists, runnerExists] = await Promise.all([
+    checkFileExists(MODEL_ENGINE_PATH),
+    checkFileExists(MODEL_ONNX_PATH),
+    checkFileExists(TENSORRT_RUNNER_PATH),
+  ]);
+
+  return {
+    engineExists,
+    onnxExists,
+    tensorRtRunnerExists: runnerExists,
+    selectedBackend:
+      engineExists && runnerExists ? "engine" : onnxExists ? "onnx" : "unavailable",
+  };
+}
+
+async function resolveInferenceBackend() {
+  const availability = await getModelAvailability();
+  if (availability.engineExists && availability.tensorRtRunnerExists) {
+    selectedInferenceBackend = "engine";
+  } else {
+    selectedInferenceBackend = "onnx";
+    if (availability.engineExists && !availability.tensorRtRunnerExists) {
+      console.warn(
+        `Engine file found at ${MODEL_ENGINE_PATH}, but TensorRT runner is missing at ${TENSORRT_RUNNER_PATH}. Falling back to ONNX.`,
+      );
+    }
+  }
+  return selectedInferenceBackend;
+}
+
+async function runTensorRtInference(imageBuffer: Buffer): Promise<LocalInferenceResult> {
+  const tempFilename = `${Date.now()}-${randomUUID()}.jpg`;
+  const tempImagePath = path.join(UPLOADS_DIR, tempFilename);
+  await fs.writeFile(tempImagePath, imageBuffer);
+
+  const labelsArg = MODEL_CLASS_LABELS.join(",");
+  return await new Promise<LocalInferenceResult>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+
+    const child = spawn(
+      "python",
+      [
+        TENSORRT_RUNNER_PATH,
+        "--engine",
+        MODEL_ENGINE_PATH,
+        "--image",
+        tempImagePath,
+        "--imgsz",
+        String(MODEL_INPUT_SIZE),
+        "--labels",
+        labelsArg,
+      ],
+      { cwd: process.cwd() },
+    );
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      reject(new Error(`Failed to start TensorRT runner: ${error.message}`));
+    });
+
+    child.on("close", async (code) => {
+      try {
+        await fs.unlink(tempImagePath);
+      } catch {
+        // Best-effort cleanup only.
+      }
+
+      if (code !== 0) {
+        reject(
+          new Error(
+            `TensorRT runner exited with code ${code}. ${stderr || stdout || "No details."}`,
+          ),
+        );
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(stdout) as {
+          class: string;
+          confidence: number;
+          recommendation: string;
+          model_version?: string;
+        };
+        resolve({
+          predictedLabel: parsed.class,
+          confidence: Number(parsed.confidence),
+          recommendation: parsed.recommendation,
+          modelVersion: parsed.model_version || "tensorrt-engine-local",
+        });
+      } catch (error) {
+        reject(
+          new Error(
+            `TensorRT runner output was not valid JSON. ${error instanceof Error ? error.message : "Unknown parse error"}`,
+          ),
+        );
+      }
+    });
+  });
+}
+
 async function preprocessImage(buffer: Buffer) {
   const sharpLib = await import("sharp");
   const sharp = sharpLib.default;
   const resized = await sharp(buffer)
-    .resize(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, { fit: "fill" })
+    .resize(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, {
+      fit: "contain",
+      position: "center",
+      background: { r: 0, g: 0, b: 0 },
+    })
     .removeAlpha()
     .raw()
     .toBuffer();
@@ -221,15 +385,40 @@ async function preprocessImage(buffer: Buffer) {
 
   for (let i = 0; i < pixelCount; i += 1) {
     const baseIndex = i * 3;
-    tensor[i] = resized[baseIndex] / 255;
-    tensor[pixelCount + i] = resized[baseIndex + 1] / 255;
-    tensor[pixelCount * 2 + i] = resized[baseIndex + 2] / 255;
+    const r = resized[baseIndex] / 255;
+    const g = resized[baseIndex + 1] / 255;
+    const b = resized[baseIndex + 2] / 255;
+    if (MODEL_NORMALIZATION === "imagenet") {
+      tensor[i] = (r - 0.485) / 0.229;
+      tensor[pixelCount + i] = (g - 0.456) / 0.224;
+      tensor[pixelCount * 2 + i] = (b - 0.406) / 0.225;
+    } else {
+      tensor[i] = r;
+      tensor[pixelCount + i] = g;
+      tensor[pixelCount * 2 + i] = b;
+    }
   }
 
   return tensor;
 }
 
 async function runLocalInference(imageBuffer: Buffer) {
+  const backend = await resolveInferenceBackend();
+  if (backend === "engine") {
+    try {
+      const engineResult = await runTensorRtInference(imageBuffer);
+      return engineResult;
+    } catch (error) {
+      console.error("TensorRT inference failed; switching to ONNX fallback.", {
+        message: error instanceof Error ? error.message : "Unknown engine error",
+      });
+      if (!ALLOW_ONNX_FALLBACK) {
+        throw error;
+      }
+      selectedInferenceBackend = "onnx";
+    }
+  }
+
   const ort = await getOrtModule();
   const session = (await getModelSession()) as {
     inputNames: string[];
@@ -251,7 +440,7 @@ async function runLocalInference(imageBuffer: Buffer) {
   if (logits.length === 0) {
     throw new Error("Model returned empty output.");
   }
-  const probabilities = softmax(logits);
+  const probabilities = normalizeOutput(logits);
   let maxIndex = 0;
   let maxConfidence = probabilities[0] ?? 0;
 
@@ -267,7 +456,7 @@ async function runLocalInference(imageBuffer: Buffer) {
   const recommendation =
     maxConfidence < MODEL_CONFIDENCE_THRESHOLD
       ? "Low confidence prediction. Please verify scan quality and review manually."
-      : predictedLabel === "No DR" || predictedLabel === "Mild DR"
+      : predictedLabel.toLowerCase() === "nrdr"
         ? "No referable diabetic retinopathy. Continue scheduled screening."
         : "Referable diabetic retinopathy suspected. Clinical review is recommended.";
 
@@ -318,13 +507,23 @@ const authMiddleware = async (
 
 app.get("/healthz", async (_req: Request, res: Response) => {
   try {
-    await pool.query("SELECT 1");
+    const [_, modelAvailability] = await Promise.all([
+      pool.query("SELECT 1"),
+      getModelAvailability(),
+    ]);
+    await resolveInferenceBackend();
     res.json({
       status: "healthy",
       backend: "up",
       database: "connected",
-      inference_backend: "onnx-local",
+      inference_backend: selectedInferenceBackend,
+      model_availability: modelAvailability,
+      model_engine_path: MODEL_ENGINE_PATH,
       model_onnx_path: MODEL_ONNX_PATH,
+      tensorrt_runner_path: TENSORRT_RUNNER_PATH,
+      model_normalization: MODEL_NORMALIZATION,
+      model_output_kind: MODEL_OUTPUT_KIND,
+      allow_onnx_fallback: ALLOW_ONNX_FALLBACK,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -475,10 +674,17 @@ app.post(
       });
 
       const startTime = Date.now();
+      const preferredBackend = await resolveInferenceBackend();
 
-      console.log("Starting local ONNX classification", {
+      console.log("Starting local classification", {
+        backend: preferredBackend,
+        enginePath: MODEL_ENGINE_PATH,
+        tensorRtRunnerPath: TENSORRT_RUNNER_PATH,
         modelPath: MODEL_ONNX_PATH,
         inputSize: MODEL_INPUT_SIZE,
+        normalization: MODEL_NORMALIZATION,
+        outputKind: MODEL_OUTPUT_KIND,
+        allowOnnxFallback: ALLOW_ONNX_FALLBACK,
       });
 
       const inference = await runLocalInference(req.file.buffer);
@@ -489,7 +695,9 @@ app.post(
       const model_version = inference.modelVersion;
 
       const screeningOutcome: "NRDR" | "RDR" =
-        severity === "No DR" || severity === "Mild DR" ? "NRDR" : "RDR";
+        severity.toLowerCase() === "nrdr" || severity === "No DR" || severity === "Mild DR"
+          ? "NRDR"
+          : "RDR";
       console.log("Classification result received", {
         severity,
         screeningOutcome,
@@ -840,8 +1048,10 @@ app.get("/api/analytics/summary", authMiddleware, async (req: AuthRequest, res: 
 app.listen(PORT, () => {
   console.log(`
 Backend server running on http://localhost:${PORT}
-Inference backend: ONNX (local)
-Model path: ${MODEL_ONNX_PATH}
+Inference backend priority: TensorRT engine -> ONNX fallback
+Engine path: ${MODEL_ENGINE_PATH}
+ONNX path: ${MODEL_ONNX_PATH}
+TensorRT runner: ${TENSORRT_RUNNER_PATH}
 Authentication: JWT
 Database: PostgreSQL
   `);
