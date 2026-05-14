@@ -12,9 +12,11 @@ dist/
 build/
 backend/dist/
 
-# 🧠 ML / model files (very important in your case)
+# 🧠 ML / model files (store best.onnx in S3; set MODEL_S3_URI in backend/.env)
 *.pt
 *.onnx
+best.onnx
+backend/best.onnx
 
 # 🧪 Logs
 logs/

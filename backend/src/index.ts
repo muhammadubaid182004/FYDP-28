@@ -7,12 +7,15 @@ import bcryptjs from "bcryptjs";
 import pg from "pg";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
   deleteImageFromS3,
+  downloadBytesFromS3ObjectUri,
   getS3EnvironmentHealth,
-  synchronizeS3ImagesFromDisk,
+  presignS3ObjectReadUrl,
+  downloadPredictionImageBuffer,
   uploadImageToS3,
   verifyS3Connectivity,
 } from "./s3.js";
@@ -22,14 +25,54 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT || 8000);
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
-const LOCAL_DATABASE_URL =
-  process.env.LOCAL_DATABASE_URL || process.env.DATABASE_URL || "";
-const DEPLOYED_DATABASE_URL = process.env.DEPLOYED_DATABASE_URL || "";
-const DATABASE_URL = LOCAL_DATABASE_URL;
-const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
-const IMAGES_DIR = path.resolve(process.cwd(), "images");
-const IMAGES_NRDR_DIR = path.join(IMAGES_DIR, "NRDR");
-const IMAGES_RDR_DIR = path.join(IMAGES_DIR, "RDR");
+const PRESIGNED_IMAGE_URL_TTL_SECONDS = Math.max(
+  60,
+  Number(process.env.PRESIGNED_IMAGE_URL_TTL_SECONDS || 3600) || 3600,
+);
+const explicitDatabaseUrl = (process.env.DATABASE_URL || "").trim();
+const localDatabaseUrl = (process.env.LOCAL_DATABASE_URL || "").trim();
+const deployedDatabaseUrl = (process.env.DEPLOYED_DATABASE_URL || "").trim();
+
+/** True when host is loopback — unusable from Docker for Postgres on the host machine. */
+function postgresUrlLooksLikeLoopback(url: string): boolean {
+  if (!url) return false;
+  return (
+    /@(localhost|127\.0\.0\.1)\b/i.test(url) ||
+    /[?&]host=(localhost|127\.0\.0\.1)\b/i.test(url)
+  );
+}
+
+function resolvePrimaryDatabaseUrl(): string {
+  if (explicitDatabaseUrl) {
+    if (postgresUrlLooksLikeLoopback(explicitDatabaseUrl) && deployedDatabaseUrl) {
+      return deployedDatabaseUrl;
+    }
+    return explicitDatabaseUrl;
+  }
+  if (localDatabaseUrl && !postgresUrlLooksLikeLoopback(localDatabaseUrl)) {
+    return localDatabaseUrl;
+  }
+  if (deployedDatabaseUrl) {
+    return deployedDatabaseUrl;
+  }
+  return localDatabaseUrl;
+}
+
+const DATABASE_URL = resolvePrimaryDatabaseUrl();
+const DEPLOYED_DATABASE_URL = deployedDatabaseUrl;
+
+if (
+  deployedDatabaseUrl &&
+  DATABASE_URL === deployedDatabaseUrl &&
+  ((localDatabaseUrl && postgresUrlLooksLikeLoopback(localDatabaseUrl)) ||
+    (explicitDatabaseUrl && postgresUrlLooksLikeLoopback(explicitDatabaseUrl)))
+) {
+  console.log(
+    "Primary DB: using DEPLOYED_DATABASE_URL (DATABASE_URL / LOCAL_DATABASE_URL use loopback and are not reachable from this runtime).",
+  );
+}
+/** Ephemeral TensorRT runner input only (not used for storing prediction images). */
+const TENSORRT_WORK_DIR = tmpdir();
 const MODEL_ENGINE_PATH = path.resolve(
   process.cwd(),
   process.env.MODEL_ENGINE_PATH || "best.engine",
@@ -38,6 +81,8 @@ const MODEL_ONNX_PATH = path.resolve(
   process.cwd(),
   process.env.MODEL_ONNX_PATH || "best.onnx",
 );
+/** Required: ONNX session is built from bytes loaded from this S3 object (in memory). TensorRT engine is not used. */
+const MODEL_S3_URI = (process.env.MODEL_S3_URI || "").trim();
 const TENSORRT_RUNNER_PATH = path.resolve(
   process.cwd(),
   process.env.TENSORRT_RUNNER_PATH || "tensorrt_inference.py",
@@ -81,6 +126,45 @@ const localPool = new Pool({
   connectionString: DATABASE_URL,
   ssl: SHOULD_USE_DATABASE_SSL ? { rejectUnauthorized: false } : undefined,
 });
+
+/** Some schemas use `review_status_val`; others only have `review_status`. */
+type PredictionsReviewStatusColumnName = "review_status_val" | "review_status";
+let cachedPredictionsReviewStatusColumn: PredictionsReviewStatusColumnName | null = null;
+
+async function getPredictionsReviewStatusColumn(): Promise<PredictionsReviewStatusColumnName> {
+  if (cachedPredictionsReviewStatusColumn) {
+    return cachedPredictionsReviewStatusColumn;
+  }
+  if (!DATABASE_URL) {
+    cachedPredictionsReviewStatusColumn = "review_status_val";
+    return cachedPredictionsReviewStatusColumn;
+  }
+  const { rows } = await localPool.query<{ column_name: string }>(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'predictions'
+        AND column_name IN ('review_status_val', 'review_status')
+    `,
+  );
+  const names = new Set(rows.map((r) => r.column_name));
+  if (names.has("review_status_val")) {
+    cachedPredictionsReviewStatusColumn = "review_status_val";
+  } else if (names.has("review_status")) {
+    cachedPredictionsReviewStatusColumn = "review_status";
+    console.log(
+      "Using column predictions.review_status (review_status_val not present). Matches many legacy / RDS schemas.",
+    );
+  } else {
+    cachedPredictionsReviewStatusColumn = "review_status_val";
+    console.warn(
+      "predictions: neither review_status_val nor review_status found in information_schema; defaulting to review_status_val.",
+    );
+  }
+  return cachedPredictionsReviewStatusColumn;
+}
+
 const deployedPool = DEPLOYED_DATABASE_URL
   ? new Pool({
       connectionString: DEPLOYED_DATABASE_URL,
@@ -91,17 +175,17 @@ const deployedPool = DEPLOYED_DATABASE_URL
 void (async () => {
   if (!DATABASE_URL) {
     console.warn(
-      "LOCAL_DATABASE_URL is not configured. Starting backend in degraded mode without local database connectivity.",
+      "DATABASE_URL / LOCAL_DATABASE_URL / DEPLOYED_DATABASE_URL is not configured. Starting backend in degraded mode without primary database connectivity.",
     );
   } else {
     try {
       const dbResult = await localPool.query("SELECT 1");
       if (dbResult.rowCount !== null) {
-        console.log("Local database connected successfully.");
+        console.log("Primary database connected successfully.");
       }
     } catch (dbError) {
       console.error(
-        "Local database connection check failed. Backend will continue running in degraded mode:",
+        "Primary database connection check failed. Backend will continue running in degraded mode:",
         dbError instanceof Error ? dbError.message : "Unknown database error",
       );
     }
@@ -178,14 +262,6 @@ async function getDeployedDatabaseConnectionState() {
   }
 }
 
-void Promise.all([
-  fs.mkdir(UPLOADS_DIR, { recursive: true }),
-  fs.mkdir(IMAGES_NRDR_DIR, { recursive: true }),
-  fs.mkdir(IMAGES_RDR_DIR, { recursive: true }),
-]).catch((error: Error) => {
-  console.error("Failed to ensure uploads/images directories exist:", error.message);
-});
-
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -199,8 +275,6 @@ app.use(
 );
 app.use(express.json());
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
-app.use("/uploads", express.static(UPLOADS_DIR));
-app.use("/images", express.static(IMAGES_DIR));
 
 const storage = multer.memoryStorage();
 const upload = multer({
@@ -271,14 +345,55 @@ function mapUserForResponse(user: DbUserRow) {
   };
 }
 
-function mapPredictionForResponse(row: PredictionHistoryRow) {
+const ALLOW_LEGACY_PLAINTEXT_PASSWORD =
+  (process.env.ALLOW_LEGACY_PLAINTEXT_PASSWORD || "").toLowerCase() === "true";
+
+/** bcrypt hashes start with $2a$ / $2b$ / $2y$; optional plaintext match when ALLOW_LEGACY_PLAINTEXT_PASSWORD=true. */
+async function verifyStoredPassword(plain: string, stored: string): Promise<boolean> {
+  const s = (stored || "").trim();
+  if (!s) return false;
+  if (/^\$2[aby]\$\d{2}\$/.test(s)) {
+    try {
+      return await bcryptjs.compare(plain, s);
+    } catch {
+      return false;
+    }
+  }
+  if (ALLOW_LEGACY_PLAINTEXT_PASSWORD && plain === s) {
+    return true;
+  }
+  return false;
+}
+
+async function resolveBrowserImageUrl(
+  uri: string | null | undefined,
+): Promise<string | undefined> {
+  if (uri == null) {
+    return undefined;
+  }
+  const trimmed = uri.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith("data:")) {
+    return trimmed;
+  }
+  if (trimmed.startsWith("s3://")) {
+    const signed = await presignS3ObjectReadUrl(trimmed, PRESIGNED_IMAGE_URL_TTL_SECONDS);
+    return signed ?? undefined;
+  }
+  return trimmed;
+}
+
+async function mapPredictionForResponse(row: PredictionHistoryRow) {
+  const image_data_url = await resolveBrowserImageUrl(row.image_data_url);
   return {
     prediction_id: row.prediction_id,
     patient_id: row.patient_id,
     patient_name: row.patient_name,
     cnic: row.cnic,
     phone: row.phone,
-    image_data_url: row.image_data_url ?? undefined,
+    image_data_url,
     severity: row.severity,
     screening_outcome: row.screening_outcome ?? undefined,
     confidence: Number(row.confidence),
@@ -465,53 +580,25 @@ async function synchronizeDatabases(): Promise<SyncRunResult | null> {
   }
 }
 
-async function synchronizeS3FromLocalDisk() {
-  const health = getS3EnvironmentHealth();
-  if (health.syncTarget === "none" || S3_SYNC_BATCH_SIZE <= 0) {
-    return null;
-  }
-  return synchronizeS3ImagesFromDisk({
-    uploadsDir: UPLOADS_DIR,
-    imagesNrdrDir: IMAGES_NRDR_DIR,
-    imagesRdrDir: IMAGES_RDR_DIR,
-    batchLimit: S3_SYNC_BATCH_SIZE,
-  });
-}
-
-function getUploadPublicUrl(req: Request, filename: string) {
-  return `${req.protocol}://${req.get("host")}/uploads/${filename}`;
-}
-
-function getOrganizedImagePublicUrl(
-  req: Request,
-  subfolder: "NRDR" | "RDR",
-  filename: string,
-) {
-  return `${req.protocol}://${req.get("host")}/images/${subfolder}/${filename}`;
-}
-
-/** RDR + accepted → RDR folder; all other outcomes → NRDR folder (local + S3 prefix). */
+/**
+ * Reviewed image S3 prefix: referable bucket when model RDR is accepted, or model NRDR is rejected
+ * (clinician upgrades to referable). Otherwise non-referable bucket.
+ */
 function getReviewedImageSubfolder(
   predictedOutcome: "NRDR" | "RDR",
   action: "accepted" | "rejected",
 ): "NRDR" | "RDR" {
-  return predictedOutcome === "RDR" && action === "accepted" ? "RDR" : "NRDR";
+  const referable =
+    (predictedOutcome === "RDR" && action === "accepted") ||
+    (predictedOutcome === "NRDR" && action === "rejected");
+  return referable ? "RDR" : "NRDR";
 }
 
-async function resolveLocalPredictionImagePath(filename: string): Promise<string | null> {
-  const candidates = [
-    path.join(UPLOADS_DIR, filename),
-    path.join(IMAGES_NRDR_DIR, filename),
-    path.join(IMAGES_RDR_DIR, filename),
-  ];
-  for (const candidate of candidates) {
-    try {
-      await fs.access(candidate);
-      return candidate;
-    } catch {
-      // try next
-    }
-  }
+function normalizeScreeningOutcome(value: string | null | undefined): "NRDR" | "RDR" | null {
+  if (value == null) return null;
+  const u = String(value).trim().toUpperCase();
+  if (u === "NRDR") return "NRDR";
+  if (u === "RDR") return "RDR";
   return null;
 }
 
@@ -520,7 +607,7 @@ let selectedInferenceBackend: "engine" | "onnx" = "onnx";
 
 type OrtModuleShape = {
   InferenceSession: {
-    create: (modelPath: string) => Promise<unknown>;
+    create: (modelPath: string | Uint8Array) => Promise<unknown>;
   };
   Tensor: new (
     type: string,
@@ -544,9 +631,13 @@ async function getOrtModule() {
 
 function getModelSession() {
   if (!modelSessionPromise) {
-    modelSessionPromise = getOrtModule().then((ort) =>
-      ort.InferenceSession.create(MODEL_ONNX_PATH),
-    );
+    modelSessionPromise = getOrtModule().then(async (ort) => {
+      if (MODEL_S3_URI) {
+        const bytes = await downloadBytesFromS3ObjectUri(MODEL_S3_URI);
+        return ort.InferenceSession.create(new Uint8Array(bytes));
+      }
+      return ort.InferenceSession.create(MODEL_ONNX_PATH);
+    });
   }
   return modelSessionPromise;
 }
@@ -582,22 +673,36 @@ async function checkFileExists(filePath: string) {
 }
 
 async function getModelAvailability() {
-  const [engineExists, onnxExists, runnerExists] = await Promise.all([
+  const [engineExists, onnxFileExists, runnerExists] = await Promise.all([
     checkFileExists(MODEL_ENGINE_PATH),
     checkFileExists(MODEL_ONNX_PATH),
     checkFileExists(TENSORRT_RUNNER_PATH),
   ]);
 
+  const onnxExists = MODEL_S3_URI ? true : onnxFileExists;
+
+  const selectedBackend = MODEL_S3_URI
+    ? "onnx"
+    : engineExists && runnerExists
+      ? "engine"
+      : onnxFileExists
+        ? "onnx"
+        : "unavailable";
+
   return {
     engineExists,
     onnxExists,
     tensorRtRunnerExists: runnerExists,
-    selectedBackend:
-      engineExists && runnerExists ? "engine" : onnxExists ? "onnx" : "unavailable",
+    selectedBackend,
+    inference_uses_s3_model_uri: Boolean(MODEL_S3_URI),
   };
 }
 
 async function resolveInferenceBackend() {
+  if (MODEL_S3_URI) {
+    selectedInferenceBackend = "onnx";
+    return "onnx";
+  }
   const availability = await getModelAvailability();
   if (availability.engineExists && availability.tensorRtRunnerExists) {
     selectedInferenceBackend = "engine";
@@ -614,7 +719,7 @@ async function resolveInferenceBackend() {
 
 async function runTensorRtInference(imageBuffer: Buffer): Promise<LocalInferenceResult> {
   const tempFilename = `${Date.now()}-${randomUUID()}.jpg`;
-  const tempImagePath = path.join(UPLOADS_DIR, tempFilename);
+  const tempImagePath = path.join(TENSORRT_WORK_DIR, tempFilename);
   await fs.writeFile(tempImagePath, imageBuffer);
 
   const labelsArg = MODEL_CLASS_LABELS.join(",");
@@ -726,20 +831,24 @@ async function preprocessImage(buffer: Buffer) {
 }
 
 async function runLocalInference(imageBuffer: Buffer) {
-  const backend = await resolveInferenceBackend();
-  if (backend === "engine") {
-    try {
-      const engineResult = await runTensorRtInference(imageBuffer);
-      return engineResult;
-    } catch (error) {
-      console.error("TensorRT inference failed; switching to ONNX fallback.", {
-        message: error instanceof Error ? error.message : "Unknown engine error",
-      });
-      if (!ALLOW_ONNX_FALLBACK) {
-        throw error;
+  if (!MODEL_S3_URI) {
+    const backend = await resolveInferenceBackend();
+    if (backend === "engine") {
+      try {
+        const engineResult = await runTensorRtInference(imageBuffer);
+        return engineResult;
+      } catch (error) {
+        console.error("TensorRT inference failed; switching to ONNX fallback.", {
+          message: error instanceof Error ? error.message : "Unknown engine error",
+        });
+        if (!ALLOW_ONNX_FALLBACK) {
+          throw error;
+        }
+        selectedInferenceBackend = "onnx";
       }
-      selectedInferenceBackend = "onnx";
     }
+  } else {
+    await resolveInferenceBackend();
   }
 
   const ort = await getOrtModule();
@@ -787,7 +896,7 @@ async function runLocalInference(imageBuffer: Buffer) {
     predictedLabel,
     confidence: maxConfidence,
     recommendation,
-    modelVersion: "onnx-local-backend",
+    modelVersion: MODEL_S3_URI ? "onnx-s3-backend" : "onnx-local-backend",
   };
 }
 
@@ -852,6 +961,7 @@ app.get("/healthz", async (_req: Request, res: Response) => {
     model_availability: modelAvailability,
     model_engine_path: MODEL_ENGINE_PATH,
     model_onnx_path: MODEL_ONNX_PATH,
+    model_s3_uri: MODEL_S3_URI || null,
     tensorrt_runner_path: TENSORRT_RUNNER_PATH,
     model_normalization: MODEL_NORMALIZATION,
     model_output_kind: MODEL_OUTPUT_KIND,
@@ -875,6 +985,14 @@ app.post("/api/auth/register", async (req: Request, res: Response) => {
       return res
         .status(400)
         .json({ error: "Username, email, and password required" });
+    }
+
+    if (!DATABASE_URL) {
+      return res.status(503).json({
+        error: "Database not configured",
+        details:
+          "Set DATABASE_URL (or LOCAL_DATABASE_URL for host-only dev). Inside Docker, do not use localhost for Postgres on the host — use your cloud URL or host.docker.internal.",
+      });
     }
 
     const existing = await localPool.query(
@@ -915,6 +1033,7 @@ app.post("/api/auth/register", async (req: Request, res: Response) => {
       );
     });
   } catch (error) {
+    console.error("POST /api/auth/register failed:", error);
     res.status(500).json({
       error: "Registration failed",
       details: error instanceof Error ? error.message : "Unknown error",
@@ -935,6 +1054,14 @@ app.post("/api/auth/login", async (req: Request, res: Response) => {
         .json({ error: "Username or email and password required" });
     }
 
+    if (!DATABASE_URL) {
+      return res.status(503).json({
+        error: "Database not configured",
+        details:
+          "Set DATABASE_URL (or LOCAL_DATABASE_URL for host-only dev). Inside Docker, localhost points at the container, not your machine — use your RDS URL or host.docker.internal.",
+      });
+    }
+
     const result = await localPool.query<DbUserRow>(
       `
         SELECT id, username, email, full_name, role, password_hash, created_at, updated_at
@@ -949,7 +1076,11 @@ app.post("/api/auth/login", async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const passwordMatch = await bcryptjs.compare(password, user.password_hash);
+    if (!user.password_hash) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const passwordMatch = await verifyStoredPassword(password, user.password_hash);
     if (!passwordMatch) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -962,6 +1093,7 @@ app.post("/api/auth/login", async (req: Request, res: Response) => {
       token,
     });
   } catch (error) {
+    console.error("POST /api/auth/login failed:", error);
     res.status(500).json({
       error: "Login failed",
       details: error instanceof Error ? error.message : "Unknown error",
@@ -1038,17 +1170,21 @@ app.post(
       });
       const fileExtension = path.extname(req.file.originalname) || ".jpg";
       const storedFilename = `${Date.now()}-${randomUUID()}${fileExtension.toLowerCase()}`;
-      const storedFilePath = path.join(UPLOADS_DIR, storedFilename);
 
-      await fs.writeFile(storedFilePath, req.file.buffer);
-
-      const imageDataUrl = getUploadPublicUrl(req, storedFilename);
-      await uploadImageToS3({
+      const s3Put = await uploadImageToS3({
         buffer: req.file.buffer,
         filename: storedFilename,
         keyPrefixes: ["pending"],
         contentType: req.file.mimetype,
       });
+      if (!s3Put?.uri) {
+        return res.status(503).json({
+          error: "S3 upload failed",
+          details:
+            "Configure S3_URI (and AWS credentials). Prediction images are stored only in S3, not on local disk.",
+        });
+      }
+      const imageStorageUri = s3Put.uri;
 
       const client = await localPool.connect();
       try {
@@ -1075,6 +1211,7 @@ app.post(
 
         const patient = patientResult.rows[0];
 
+        const reviewStatusCol = await getPredictionsReviewStatusColumn();
         const predictionResult = await client.query<PredictionHistoryRow>(
           `
             INSERT INTO predictions (
@@ -1090,7 +1227,7 @@ app.post(
               model_version,
               jetson_inference_time_ms,
               requires_review,
-              review_status
+              ${reviewStatusCol}
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, 'pending')
             RETURNING
@@ -1107,14 +1244,14 @@ app.post(
               model_version,
               jetson_inference_time_ms AS jetson_inference_time,
               created_at,
-              review_status,
+              ${reviewStatusCol} AS review_status,
               clinician_comment,
               reviewed_at
           `,
           [
             patient.id,
             req.userId,
-            imageDataUrl,
+            imageStorageUri,
             storedFilename,
             req.file.mimetype,
             severity,
@@ -1130,17 +1267,11 @@ app.post(
         );
 
         await client.query("COMMIT");
-        res.json(mapPredictionForResponse(predictionResult.rows[0]));
+        res.json(await mapPredictionForResponse(predictionResult.rows[0]));
         void synchronizeDatabases().catch((error) => {
           console.error(
             "Post-classification sync attempt failed. Will retry on schedule:",
             error instanceof Error ? error.message : "Unknown sync error",
-          );
-        });
-        void synchronizeS3FromLocalDisk().catch((error) => {
-          console.error(
-            "Post-classification S3 disk sync failed. Will retry on schedule:",
-            error instanceof Error ? error.message : "Unknown S3 sync error",
           );
         });
       } catch (error) {
@@ -1167,6 +1298,7 @@ app.post(
 
 app.get("/api/predictions", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    const reviewStatusCol = await getPredictionsReviewStatusColumn();
     const result = await localPool.query<PredictionHistoryRow>(
       `
         SELECT
@@ -1183,7 +1315,7 @@ app.get("/api/predictions", authMiddleware, async (req: AuthRequest, res: Respon
           p.model_version,
           p.jetson_inference_time_ms AS jetson_inference_time,
           p.created_at,
-          p.review_status,
+          p.${reviewStatusCol} AS review_status,
           p.clinician_comment,
           p.reviewed_at
         FROM predictions p
@@ -1194,7 +1326,7 @@ app.get("/api/predictions", authMiddleware, async (req: AuthRequest, res: Respon
 
     res.json({
       total: result.rows.length,
-      predictions: result.rows.map(mapPredictionForResponse),
+      predictions: await Promise.all(result.rows.map((row) => mapPredictionForResponse(row))),
     });
   } catch (error) {
     res.status(500).json({
@@ -1209,6 +1341,7 @@ app.get(
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
     try {
+      const reviewStatusCol = await getPredictionsReviewStatusColumn();
       const result = await localPool.query<PredictionHistoryRow>(
         `
           SELECT
@@ -1225,7 +1358,7 @@ app.get(
             p.model_version,
             p.jetson_inference_time_ms AS jetson_inference_time,
             p.created_at,
-            p.review_status,
+            p.${reviewStatusCol} AS review_status,
             p.clinician_comment,
             p.reviewed_at
           FROM predictions p
@@ -1240,7 +1373,7 @@ app.get(
         return res.status(404).json({ error: "Prediction not found" });
       }
 
-      res.json(mapPredictionForResponse(prediction));
+      res.json(await mapPredictionForResponse(prediction));
     } catch (error) {
       res.status(500).json({
         error: "Failed to fetch prediction",
@@ -1276,29 +1409,10 @@ app.post("/api/db/synchronize", authMiddleware, async (_req: AuthRequest, res: R
 });
 
 app.post("/api/s3/synchronize", authMiddleware, async (_req: AuthRequest, res: Response) => {
-  try {
-    const health = getS3EnvironmentHealth();
-    if (health.syncTarget === "none") {
-      return res.status(400).json({
-        error: "S3 is not configured (set S3_URI)",
-      });
-    }
-    const syncResult = await synchronizeS3FromLocalDisk();
-    if (!syncResult) {
-      return res.status(202).json({
-        message: "S3 synchronization is already in progress or batch size is zero",
-      });
-    }
-    return res.json({
-      message: "S3 disk synchronization completed",
-      result: syncResult,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: "S3 synchronization failed",
-      details: error instanceof Error ? error.message : "Unknown error",
-    });
-  }
+  return res.status(400).json({
+    error: "S3 disk synchronization is disabled",
+    details: "Images are uploaded directly to S3; there is no local uploads folder to sync.",
+  });
 });
 
 app.post(
@@ -1306,14 +1420,24 @@ app.post(
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
     try {
-      const { action, clinicianComment } = req.body as {
-        action?: "accepted" | "rejected";
+      const body = req.body as {
+        action?: string;
         clinicianComment?: string;
+        clinician_comment?: string;
       };
+      const actionRaw = typeof body.action === "string" ? body.action.trim().toLowerCase() : "";
+      const action = actionRaw === "accepted" || actionRaw === "rejected" ? actionRaw : undefined;
+      const clinicianComment =
+        typeof body.clinicianComment === "string"
+          ? body.clinicianComment
+          : typeof body.clinician_comment === "string"
+            ? body.clinician_comment
+            : "";
 
       if (action !== "accepted" && action !== "rejected") {
         return res.status(400).json({ error: "Action must be accepted or rejected" });
       }
+      const reviewStatusCol = await getPredictionsReviewStatusColumn();
       const client = await localPool.connect();
       try {
         await client.query("BEGIN");
@@ -1322,13 +1446,15 @@ app.post(
           image_filename: string | null;
           mime_type: string | null;
           screening_outcome: "NRDR" | "RDR" | null;
+          image_storage_uri: string | null;
         }>(
           `
             SELECT
               id AS prediction_id,
               image_filename,
               mime_type,
-              screening_outcome
+              screening_outcome,
+              image_storage_uri
             FROM predictions
             WHERE id = $1
             FOR UPDATE
@@ -1346,27 +1472,19 @@ app.post(
           throw new Error("Prediction image filename is missing");
         }
 
-        const localImagePath = await resolveLocalPredictionImagePath(
-          currentPrediction.image_filename,
+        const localImageBuffer = await downloadPredictionImageBuffer({
+          imageStorageUri: currentPrediction.image_storage_uri,
+          filename: currentPrediction.image_filename,
+        });
+        const screening = normalizeScreeningOutcome(
+          currentPrediction.screening_outcome as string | null | undefined,
         );
-        if (!localImagePath) {
+        if (!screening) {
           throw new Error(
-            `Prediction image file not found on disk: ${currentPrediction.image_filename}`,
+            `Prediction screening outcome is invalid: ${String(currentPrediction.screening_outcome)}`,
           );
         }
-        const localImageBuffer = await fs.readFile(localImagePath);
-        if (
-          currentPrediction.screening_outcome !== "NRDR" &&
-          currentPrediction.screening_outcome !== "RDR"
-        ) {
-          throw new Error("Prediction screening outcome is invalid");
-        }
-        const reviewedFolder = getReviewedImageSubfolder(
-          currentPrediction.screening_outcome,
-          action,
-        );
-        const destDir = reviewedFolder === "RDR" ? IMAGES_RDR_DIR : IMAGES_NRDR_DIR;
-        const destPath = path.join(destDir, currentPrediction.image_filename);
+        const reviewedFolder = getReviewedImageSubfolder(screening, action);
         const reviewedUpload = await uploadImageToS3({
           buffer: localImageBuffer,
           filename: currentPrediction.image_filename,
@@ -1374,36 +1492,29 @@ app.post(
           contentType: currentPrediction.mime_type || undefined,
         });
         const reviewedRemoteUri = reviewedUpload?.uri ?? null;
+        if (!reviewedRemoteUri) {
+          throw new Error("S3 upload failed for reviewed image");
+        }
         await deleteImageFromS3({
           filename: currentPrediction.image_filename,
           keyPrefixes: ["pending"],
         });
-
-        if (path.resolve(localImagePath) !== path.resolve(destPath)) {
-          await fs.mkdir(destDir, { recursive: true });
-          await fs.rename(localImagePath, destPath);
-        }
-        const organizedLocalUri = getOrganizedImagePublicUrl(
-          req,
-          reviewedFolder,
-          currentPrediction.image_filename,
-        );
-        const imageUriForDb = reviewedRemoteUri ?? organizedLocalUri;
+        const imageUriForDb = reviewedRemoteUri;
 
         const result = await client.query<PredictionHistoryRow>(
           `
             UPDATE predictions p
             SET
-              review_status = $1::review_status,
-              clinician_comment = $2,
+              ${reviewStatusCol} = '${action}',
+              clinician_comment = $1,
               reviewed_at = NOW(),
-              reviewed_by_user_id = $3,
+              reviewed_by_user_id = $2,
               requires_review = FALSE,
-              image_storage_uri = COALESCE($5, image_storage_uri),
+              image_storage_uri = COALESCE($4, image_storage_uri),
               updated_at = NOW()
             FROM patients pt
             WHERE
-              p.id = $4
+              p.id = $3
               AND pt.id = p.patient_id
             RETURNING
               p.id AS prediction_id,
@@ -1419,12 +1530,11 @@ app.post(
               p.model_version,
               p.jetson_inference_time_ms AS jetson_inference_time,
               p.created_at,
-              p.review_status,
+              p.${reviewStatusCol} AS review_status,
               p.clinician_comment,
               p.reviewed_at
           `,
           [
-            action,
             clinicianComment?.trim() || null,
             req.userId,
             req.params.predictionId,
@@ -1432,14 +1542,12 @@ app.post(
           ],
         );
 
+        if (!result.rows[0]) {
+          throw new Error("Review update did not match any row (check prediction id and patient link).");
+        }
+
         await client.query("COMMIT");
-        res.json(mapPredictionForResponse(result.rows[0]));
-        void synchronizeS3FromLocalDisk().catch((error) => {
-          console.error(
-            "Post-review S3 disk sync failed. Will retry on schedule:",
-            error instanceof Error ? error.message : "Unknown S3 sync error",
-          );
-        });
+        res.json(await mapPredictionForResponse(result.rows[0]));
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;
@@ -1447,6 +1555,7 @@ app.post(
         client.release();
       }
     } catch (error) {
+      console.error("POST /api/predictions/:predictionId/review failed:", error);
       res.status(500).json({
         error: "Failed to update review status",
         details: error instanceof Error ? error.message : "Unknown error",
@@ -1457,6 +1566,7 @@ app.post(
 
 app.get("/api/analytics/summary", authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    const reviewStatusCol = await getPredictionsReviewStatusColumn();
     const [summaryResult, recentResult] = await Promise.all([
       localPool.query<{
         total_predictions: string;
@@ -1497,7 +1607,7 @@ app.get("/api/analytics/summary", authMiddleware, async (req: AuthRequest, res: 
             p.model_version,
             p.jetson_inference_time_ms AS jetson_inference_time,
             p.created_at,
-            p.review_status,
+            p.${reviewStatusCol} AS review_status,
             p.clinician_comment,
             p.reviewed_at
           FROM predictions p
@@ -1520,7 +1630,9 @@ app.get("/api/analytics/summary", authMiddleware, async (req: AuthRequest, res: 
       },
       average_confidence: Number(Number(summary.average_confidence ?? 0).toFixed(2)),
       average_inference_time_ms: Math.round(Number(summary.average_inference_time_ms ?? 0)),
-      most_recent: recentResult.rows[0] ? mapPredictionForResponse(recentResult.rows[0]) : null,
+      most_recent: recentResult.rows[0]
+        ? await mapPredictionForResponse(recentResult.rows[0])
+        : null,
     });
   } catch (error) {
     res.status(500).json({
@@ -1559,53 +1671,37 @@ if (deployedPool && DB_SYNC_INTERVAL_MS > 0) {
   );
 }
 
-const s3PeriodicHealth = getS3EnvironmentHealth();
-if (s3PeriodicHealth.syncTarget !== "none" && S3_SYNC_INTERVAL_MS > 0) {
-  void synchronizeS3FromLocalDisk().catch((error) => {
+async function ensureServingPreconditions() {
+  if (!MODEL_S3_URI) {
     console.error(
-      "Initial S3 disk sync failed. Periodic retries remain enabled:",
-      error instanceof Error ? error.message : "Unknown S3 sync error",
+      "MODEL_S3_URI is required. Inference loads ONNX bytes from this S3 object into memory (no local best.onnx required).",
     );
-  });
-
-  setInterval(() => {
-    void synchronizeS3FromLocalDisk()
-      .then((result) => {
-        if (!result) {
-          return;
-        }
-        console.log("Periodic S3 disk sync completed", result);
-      })
-      .catch((error) => {
-        console.error(
-          "Periodic S3 disk sync failed:",
-          error instanceof Error ? error.message : "Unknown S3 sync error",
-        );
-      });
-  }, S3_SYNC_INTERVAL_MS);
-
-  console.log(
-    `Periodic S3 disk synchronization enabled every ${S3_SYNC_INTERVAL_MS} ms (batch size ${S3_SYNC_BATCH_SIZE}; target=${s3PeriodicHealth.syncTarget}).`,
-  );
+    process.exit(1);
+  }
 }
 
-app.listen(PORT, () => {
-  const s3Sync = getS3EnvironmentHealth();
-  console.log(`
+void ensureServingPreconditions().then(() => {
+  app.listen(PORT, () => {
+    const s3Sync = getS3EnvironmentHealth();
+    const inferenceLine = MODEL_S3_URI
+      ? `Inference: ONNX from MODEL_S3_URI (in memory; TensorRT disabled)\nMODEL_S3_URI: ${MODEL_S3_URI}`
+      : `Inference backend priority: TensorRT engine -> ONNX fallback`;
+    console.log(`
 Backend server running on http://localhost:${PORT}
-Inference backend priority: TensorRT engine -> ONNX fallback
+${inferenceLine}
 Engine path: ${MODEL_ENGINE_PATH}
 ONNX path: ${MODEL_ONNX_PATH}
 TensorRT runner: ${TENSORRT_RUNNER_PATH}
 Authentication: JWT
-Database: PostgreSQL (local primary${deployedPool ? ", deployed sync enabled" : ""})
-S3 disk sync target: ${s3Sync.syncTarget}
+Database: PostgreSQL (primary app pool${deployedPool ? ", deployed sync pool" : ""})
+S3 images: direct upload (target=${s3Sync.syncTarget})
   `);
-  if (s3Sync.syncTarget === "none") {
-    console.warn(
-      "S3 disk sync and runtime S3 uploads are disabled: set S3_URI (e.g. s3://your-bucket/prefix) to enable them.",
-    );
-  }
+    if (s3Sync.syncTarget === "none") {
+      console.warn(
+        "S3 is not configured: set S3_URI (e.g. s3://your-bucket/prefix) so prediction images can be stored.",
+      );
+    }
+  });
 });
 
 export default app;

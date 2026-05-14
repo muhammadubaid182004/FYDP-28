@@ -1,10 +1,12 @@
 import {
   DeleteObjectCommand,
+  GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -323,6 +325,114 @@ async function headObjectExists(runtime: S3Runtime, key: string) {
   }
 }
 
+function parseS3ObjectUri(uri: string): { bucket: string; key: string } | null {
+  const trimmed = uri.trim();
+  if (!trimmed.startsWith("s3://")) {
+    return null;
+  }
+  try {
+    const u = new URL(trimmed.replace(/^s3:/, "http:"));
+    const bucket = u.hostname;
+    const key = u.pathname.replace(/^\/+/, "");
+    if (!bucket || !key) {
+      return null;
+    }
+    return { bucket, key };
+  } catch {
+    return null;
+  }
+}
+
+async function readS3ObjectBuffer(runtime: S3Runtime, key: string): Promise<Buffer> {
+  const response = await runtime.s3Client.send(
+    new GetObjectCommand({
+      Bucket: runtime.parsedS3Location.bucket,
+      Key: key,
+    }),
+  );
+  const body = response.Body;
+  if (!body) {
+    throw new Error("S3 GetObject returned empty body");
+  }
+  const transform = body as { transformToByteArray?: () => Promise<Uint8Array> };
+  if (typeof transform.transformToByteArray === "function") {
+    const bytes = await transform.transformToByteArray();
+    return Buffer.from(bytes);
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of body as AsyncIterable<Uint8Array>) {
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+function uniqueS3Runtimes(...candidates: Array<S3Runtime | null | undefined>): S3Runtime[] {
+  const out: S3Runtime[] = [];
+  for (const r of candidates) {
+    if (!r) continue;
+    if (!out.some((o) => runtimesAreSamePhysical(o, r))) {
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+/**
+ * Load prediction image bytes from S3 only (by stored URI or by filename under pending/NRDR/RDR).
+ */
+export async function downloadPredictionImageBuffer(params: {
+  imageStorageUri?: string | null;
+  filename: string;
+}): Promise<Buffer> {
+  const { imageStorageUri, filename } = params;
+  if (!filename) {
+    throw new Error("Image filename is required");
+  }
+
+  const parsed = imageStorageUri ? parseS3ObjectUri(imageStorageUri) : null;
+  if (parsed) {
+    const candidates = uniqueS3Runtimes(
+      getDeployedRuntimeConfig(),
+      getPrimaryRuntimeConfig(),
+      getSyncTargetRuntime(),
+    );
+    for (const runtime of candidates) {
+      if (runtime.parsedS3Location.bucket !== parsed.bucket) {
+        continue;
+      }
+      try {
+        return await readS3ObjectBuffer(runtime, parsed.key);
+      } catch (error) {
+        console.error(
+          "S3 GetObject by URI failed:",
+          error instanceof Error ? error.message : "Unknown error",
+        );
+      }
+    }
+    throw new Error(`S3 object not readable: ${imageStorageUri}`);
+  }
+
+  const runtimes = uniqueS3Runtimes(
+    getSyncTargetRuntime(),
+    getDeployedRuntimeConfig(),
+    getPrimaryRuntimeConfig(),
+  );
+  if (runtimes.length === 0) {
+    throw new Error("S3 is not configured");
+  }
+
+  for (const runtime of runtimes) {
+    for (const prefix of ["pending", "NRDR", "RDR"]) {
+      const key = buildObjectKey(runtime, { filename, keyPrefixes: [prefix] });
+      if (await headObjectExists(runtime, key)) {
+        return await readS3ObjectBuffer(runtime, key);
+      }
+    }
+  }
+
+  throw new Error(`Image not found in S3 for filename: ${filename}`);
+}
+
 export async function uploadImageToS3(params: {
   buffer: Buffer;
   filename: string;
@@ -533,5 +643,94 @@ export async function synchronizeS3ImagesFromDisk(params: {
     };
   } finally {
     isS3DiskSyncInProgress = false;
+  }
+}
+
+function parseS3ObjectLocation(uri: string): { bucket: string; key: string } | null {
+  try {
+    const parsed = new URL(uri);
+    if (parsed.protocol !== "s3:") {
+      return null;
+    }
+    const bucket = parsed.hostname.trim();
+    const key = parsed.pathname.replace(/^\/+/, "");
+    if (!bucket || !key) {
+      return null;
+    }
+    return { bucket, key };
+  } catch {
+    return null;
+  }
+}
+
+function getRuntimeForObjectBucket(bucket: string): S3Runtime | null {
+  const deployed = getDeployedRuntimeConfig();
+  const primary = getPrimaryRuntimeConfig();
+  if (deployed?.parsedS3Location.bucket === bucket) {
+    return deployed;
+  }
+  if (primary?.parsedS3Location.bucket === bucket) {
+    return primary;
+  }
+  return null;
+}
+
+function getAnyS3RuntimeForGetObject(): S3Runtime | null {
+  return getPrimaryRuntimeConfig() ?? getDeployedRuntimeConfig();
+}
+
+/**
+ * Download a full object (e.g. ONNX weights) from S3. Uses the same clients/credentials as image storage.
+ */
+export async function downloadBytesFromS3ObjectUri(objectUri: string): Promise<Buffer> {
+  const loc = parseS3ObjectLocation(objectUri.trim());
+  if (!loc || !loc.key) {
+    throw new Error(
+      "MODEL_S3_URI must be a full object URI including key, e.g. s3://my-bucket/models/best.onnx",
+    );
+  }
+  const runtime = getRuntimeForObjectBucket(loc.bucket) ?? getAnyS3RuntimeForGetObject();
+  if (!runtime) {
+    throw new Error(
+      "Cannot load model from S3: set S3_URI (or LOCAL_S3_URI) and AWS credentials so GetObject is allowed.",
+    );
+  }
+  const out = await runtime.s3Client.send(
+    new GetObjectCommand({ Bucket: loc.bucket, Key: loc.key }),
+  );
+  if (!out.Body) {
+    throw new Error("S3 GetObject returned an empty body for the model object");
+  }
+  return Buffer.from(await out.Body.transformToByteArray());
+}
+
+/**
+ * Turn s3://bucket/key into a time-limited HTTPS URL for use in browsers (img src, etc.).
+ */
+export async function presignS3ObjectReadUrl(
+  s3Uri: string,
+  expiresInSeconds = 3600,
+): Promise<string | null> {
+  const loc = parseS3ObjectLocation(s3Uri);
+  if (!loc) {
+    return null;
+  }
+  const runtime = getRuntimeForObjectBucket(loc.bucket);
+  if (!runtime) {
+    console.warn("presignS3ObjectReadUrl: no S3 client configured for bucket", loc.bucket);
+    return null;
+  }
+  try {
+    const command = new GetObjectCommand({
+      Bucket: loc.bucket,
+      Key: loc.key,
+    });
+    return await getSignedUrl(runtime.s3Client, command, { expiresIn: expiresInSeconds });
+  } catch (error) {
+    console.error(
+      "presignS3ObjectReadUrl failed:",
+      error instanceof Error ? error.message : error,
+    );
+    return null;
   }
 }

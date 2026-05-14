@@ -8,11 +8,13 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "model:upload": "node scripts/upload-model-to-s3.mjs",
     "typecheck": "tsc --noEmit",
     "infer:onnx": "node onnx_inference.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1045.0",
+    "@aws-sdk/s3-request-presigner": "^3.1045.0",
     "axios": "^1.6.2",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",

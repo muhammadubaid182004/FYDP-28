@@ -1,0 +1,71 @@
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║   🚀 DIABETIC VISION SYSTEM - QUICK DEPLOY GUIDE            ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────┐
+│ STEP 1: Push to GitHub (1 minute)                           │
+└──────────────────────────────────────────────────────────────┘
+
+    .\deploy.ps1
+
+    OR manually:
+    
+    git add .
+    git commit -m "Add deployment config"
+    git push origin main
+
+
+┌──────────────────────────────────────────────────────────────┐
+│ STEP 2: Deploy on Render (5 minutes)                        │
+└──────────────────────────────────────────────────────────────┘
+
+    1. Go to: https://render.com
+    2. Sign in with GitHub
+    3. Click "New +" → "Blueprint"
+    4. Select repo: FYDP-28
+    5. Add secrets:
+       • AWS_ACCESS_KEY_ID = 
+       • AWS_SECRET_ACCESS_KEY = 
+    6. Click "Apply"
+
+
+┌──────────────────────────────────────────────────────────────┐
+│ YOUR LIVE URLS (after ~8 min build)                         │
+└──────────────────────────────────────────────────────────────┘
+
+    Frontend: https://diabetic-vision-frontend.onrender.com
+    Backend:  https://diabetic-vision-backend.onrender.com
+
+
+┌──────────────────────────────────────────────────────────────┐
+│ VERIFY DEPLOYMENT                                            │
+└──────────────────────────────────────────────────────────────┘
+
+    curl https://diabetic-vision-backend.onrender.com/healthz
+    
+    Expected: {"status":"ok"}
+
+
+┌──────────────────────────────────────────────────────────────┐
+│ TROUBLESHOOTING                                              │
+└──────────────────────────────────────────────────────────────┘
+
+    Build failed?     → Check logs in Render dashboard
+    DB not connected? → Render auto-sets DATABASE_URL
+    Model error?      → Ensure best.onnx is committed
+
+
+┌──────────────────────────────────────────────────────────────┐
+│ FULL GUIDES                                                  │
+└──────────────────────────────────────────────────────────────┘
+
+    📋 DEPLOYMENT_CHECKLIST.md    - Step-by-step checklist
+    📖 RENDER_DEPLOY.md           - Detailed instructions
+    🎯 DEPLOYMENT.md              - Alternative methods
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  Total Time: ~10 minutes | Cost: FREE                       ║
+╚══════════════════════════════════════════════════════════════╝
