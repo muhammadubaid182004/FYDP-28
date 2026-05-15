@@ -11,7 +11,7 @@ services:
     environment:
       PORT: "8000"
       NODE_ENV: production
-      FRONTEND_URL: http://localhost:3000
+      # FRONTEND_URL: set in backend/.env (do not override here — breaks EC2 CORS)
       MODEL_ONNX_PATH: ${MODEL_ONNX_PATH:-best.onnx}
       MODEL_ENGINE_PATH: ${MODEL_ENGINE_PATH:-models/best.engine}
       ALLOW_ONNX_FALLBACK: ${ALLOW_ONNX_FALLBACK:-true}
@@ -26,7 +26,8 @@ services:
       context: ./Client
       dockerfile: Dockerfile
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        # Empty = same-origin via Nginx (/api). Set explicitly for non-proxied deploys.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
     restart: unless-stopped
     ports:
       - "3000:3000"
