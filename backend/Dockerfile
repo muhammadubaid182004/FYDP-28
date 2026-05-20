@@ -1,46 +1,31 @@
-# ================================================
-# Build Stage
-# ================================================
-FROM node:20-alpine AS builder
+# Debian-based image: onnxruntime-node and sharp distribute prebuilt glibc binaries (musl/alpine breaks often).
+
+FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* pnpm-lock.yaml* ./
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Install dependencies
-RUN npm install
-
-# Copy source code
-COPY backend/src ./src
-COPY backend/tsconfig.json ./
-
-# Build TypeScript
+COPY tsconfig.json ./
+COPY src ./src/
 RUN npm run build
 
-# ================================================
-# Production Stage
-# ================================================
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-# Install production dependencies only
-COPY package.json package-lock.json* pnpm-lock.yaml* ./
-RUN npm install --production
+COPY package.json package-lock.json ./
+COPY --from=builder /app/node_modules ./node_modules
+RUN npm prune --omit=dev
 
-# Copy built application from builder
 COPY --from=builder /app/dist ./dist
 
-# Create database directory
-RUN mkdir -p /app/data
+RUN mkdir -p data
 
-# Health check
-HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:8000/healthz', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
-
-# Expose port
 EXPOSE 8000
 
-# Start application
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=5 \
+  CMD node -e "require('http').get('http://127.0.0.1:8000/healthz',res=>process.exit(res.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+
 CMD ["node", "dist/index.js"]

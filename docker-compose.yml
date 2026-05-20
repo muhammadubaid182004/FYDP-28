@@ -1,63 +1,35 @@
-version: '3.9'
-
 services:
-  # ─────────────────────────────────────────────────────────────
-  # Frontend Service (Node.js + React)
-  # ─────────────────────────────────────────────────────────────
-  frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dr-detection-frontend
-    ports:
-      - "3000:3000"
-    environment:
-      - VITE_API_BASE_URL=http://localhost:8000
-    depends_on:
-      - backend
-    volumes:
-      - ./src:/app/src
-      - ./public:/app/public
-    networks:
-      - dr-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # ─────────────────────────────────────────────────────────────
-  # Backend Service (Node.js + Express)
-  # Communicates with external Jetson Orin Nano
-  # ─────────────────────────────────────────────────────────────
   backend:
     build:
-      context: .
-      dockerfile: backend/Dockerfile
-    container_name: dr-detection-backend
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
     ports:
       - "8000:8000"
     environment:
-      - PORT=8000
-      - NODE_ENV=${NODE_ENV:-production}
-      - JWT_SECRET=${JWT_SECRET:-change-this-in-production}
-      - FRONTEND_URL=http://localhost:3000
-      - JETSON_IP_ADDRESS=${JETSON_IP_ADDRESS:-localhost}
-      - DB_PATH=/app/data/predictions.db
+      PORT: "8000"
+      NODE_ENV: production
+      # FRONTEND_URL: set in backend/.env (do not override here — breaks EC2 CORS)
+      MODEL_ONNX_PATH: ${MODEL_ONNX_PATH:-best.onnx}
+      MODEL_ENGINE_PATH: ${MODEL_ENGINE_PATH:-models/best.engine}
+      ALLOW_ONNX_FALLBACK: ${ALLOW_ONNX_FALLBACK:-true}
+      MODEL_CLASS_LABELS: ${MODEL_CLASS_LABELS:-Nrdr,Rdr}
+      MODEL_INPUT_SIZE: ${MODEL_INPUT_SIZE:-256}
+      # DATABASE_URL and other secrets: backend/.env (your existing Postgres).
     volumes:
-      - backend_data:/app/data
-    networks:
-      - dr-network
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/healthz"]
-      interval: 10s
-      timeout: 5s
-      start-period: 5s
-      retries: 3
+      - ./models:/app/models:ro
 
-networks:
-  dr-network:
-    driver: bridge
-
-volumes:
-  backend_data:
+  client:
+    build:
+      context: ./Client
+      dockerfile: Dockerfile
+      args:
+        # Empty = same-origin via Nginx (/api). Set explicitly for non-proxied deploys.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
